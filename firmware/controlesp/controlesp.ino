@@ -1,16 +1,24 @@
 /*
- * controlesp — Control de luces y lectura de sensores con ESP32 desde una página web.
+ * controlesp — Control de luces y lectura de sensores con ESP32 desde LabVIEW.
  *
- * Qué hace:
- *   1. El ESP32 se conecta a tu red WiFi.
- *   2. Levanta un servidor web en el puerto 80.
- *   3. Sirve una página (pagina.h) para controlar salidas y ver entradas.
- *   4. Expone una API JSON que puede usar cualquier otra app:
- *        GET  /api/estado               -> estado de todas las salidas y entradas
- *        POST /api/salida  id=N valor=V -> cambia una salida (0/1 o 0-255 si es PWM)
+ * El ESP32 entiende el MISMO protocolo de texto por dos vías:
+ *   - USB / Serial  (LabVIEW: VISA Serial, 115200 baudios)
+ *   - WiFi / TCP    (LabVIEW: TCP Open Connection, puerto 5000)
+ *
+ * Cada comando es una línea terminada en '\n' (o \r\n). Cada respuesta termina en \r\n.
+ *   PING              -> PONG
+ *   INFO              -> INFO,<nSalidas>,<nEntradas>,<nombre1>,<nombre2>,...
+ *   GET               -> DATA,<salida0>,...,<salidaN>,<entrada0>,...,<entradaM>
+ *   SET <id> <valor>  -> OK,<id>,<valor>     (valor 0/1, o 0-255 si la salida es PWM)
+ *   STREAM <ms>       -> OK,STREAM,<ms>      y luego envía una línea DATA cada <ms>
+ *   STREAM 0          -> OK,STREAM,0         (detiene el envío automático)
+ *   (error)           -> ERR,<motivo>
+ * Las líneas que empiezan con '#' son mensajes informativos: LabVIEW debe ignorarlas.
+ *
+ * Extra: también sirve una página web en http://<ip>/ y una API JSON (/api/estado, /api/salida).
  *
  * Placa:  "ESP32 Dev Module" (core de Espressif para Arduino, 2.x o 3.x)
- * No necesita librerías externas: WiFi, WebServer y ESPmDNS vienen con el core.
+ * No necesita librerías externas.
  */
 
 #include <WiFi.h>
@@ -19,13 +27,17 @@
 #include "pagina.h"
 
 // ====================== CONFIGURACIÓN — EDITA ESTO ======================
+// Si solo vas a usar USB, puedes dejar el WiFi así: el ESP32 sigue funcionando por Serial.
 const char* WIFI_SSID     = "TU_RED_WIFI";
 const char* WIFI_PASSWORD = "TU_CONTRASENA";
-const char* NOMBRE_MDNS   = "controlesp";   // la página quedará en http://controlesp.local
+const char* NOMBRE_MDNS   = "controlesp";   // http://controlesp.local
+const uint16_t PUERTO_TCP = 5000;           // puerto para LabVIEW por WiFi
+const unsigned long BAUDIOS = 115200;
 
-// Salidas (luces, relés, LEDs).
+// Salidas (luces, relés, LEDs). El orden define el <id> (0, 1, 2...).
 //   invertida = true  -> para módulos de relé que se activan con LOW (la mayoría).
 //   pwm       = true  -> salida con intensidad 0-255 (LED dimmable con MOSFET, etc.).
+// Usa nombres sin tildes ni comas (LabVIEW los recibe separados por comas).
 struct Salida {
   const char* nombre;
   uint8_t gpio;
@@ -50,8 +62,8 @@ struct Entrada {
 };
 
 Entrada entradas[] = {
-  { "Sensor de luz (LDR)", 34, ANALOGICA },
-  { "Puerta / botón",       4, DIGITAL   },   // con INPUT_PULLUP: 1 = abierto, 0 = cerrado a GND
+  { "Sensor luz LDR", 34, ANALOGICA },   // 0-4095
+  { "Puerta boton",    4, DIGITAL   },   // INPUT_PULLUP: 1 = abierto, 0 = cerrado a GND
 };
 // ========================================================================
 
@@ -59,8 +71,19 @@ const size_t N_SALIDAS  = sizeof(salidas)  / sizeof(salidas[0]);
 const size_t N_ENTRADAS = sizeof(entradas) / sizeof(entradas[0]);
 
 WebServer server(80);
+WiFiServer servidorTCP(PUERTO_TCP);
+WiFiClient clienteTCP;
 
-// Aplica el valor lógico de una salida al pin físico.
+// Estado de cada canal de comandos (Serial y TCP).
+struct Canal {
+  String buffer;
+  unsigned long periodoStream = 0;   // 0 = sin envío automático
+  unsigned long ultimoEnvio = 0;
+};
+Canal canalSerial, canalTCP;
+
+// ======================= Entradas / salidas =======================
+
 void aplicarSalida(Salida& s) {
   if (s.pwm) {
     int v = constrain(s.valor, 0, 255);
@@ -75,7 +98,98 @@ int leerEntrada(const Entrada& e) {
   return e.tipo == ANALOGICA ? analogRead(e.gpio) : digitalRead(e.gpio);
 }
 
-// Cabeceras CORS: permiten llamar a la API desde otra página/app de tu red.
+// Cambia una salida. Devuelve false si el id no existe.
+bool cambiarSalida(long id, long valor) {
+  if (id < 0 || id >= (long)N_SALIDAS) return false;
+  Salida& s = salidas[id];
+  s.valor = s.pwm ? constrain(valor, 0, 255) : (valor ? 1 : 0);
+  aplicarSalida(s);
+  return true;
+}
+
+// ================== Protocolo de texto (LabVIEW) ==================
+
+String lineaDatos() {
+  String r = "DATA";
+  for (size_t i = 0; i < N_SALIDAS; i++)  { r += ','; r += salidas[i].valor; }
+  for (size_t i = 0; i < N_ENTRADAS; i++) { r += ','; r += leerEntrada(entradas[i]); }
+  return r;
+}
+
+String lineaInfo() {
+  String r = "INFO," + String(N_SALIDAS) + "," + String(N_ENTRADAS);
+  for (size_t i = 0; i < N_SALIDAS; i++)  { r += ','; r += salidas[i].nombre; }
+  for (size_t i = 0; i < N_ENTRADAS; i++) { r += ','; r += entradas[i].nombre; }
+  return r;
+}
+
+// Interpreta una línea. Acepta espacios o comas como separador: "SET 0 1" o "SET,0,1".
+String procesarComando(String linea, Canal& canal) {
+  linea.trim();
+  linea.replace(',', ' ');
+  char cmd[16] = {0};
+  long a = 0, b = 0;
+  int n = sscanf(linea.c_str(), "%15s %ld %ld", cmd, &a, &b);
+  String c = String(cmd);
+  c.toUpperCase();
+
+  if (n < 1)          return "ERR,linea vacia";
+  if (c == "PING")    return "PONG";
+  if (c == "INFO")    return lineaInfo();
+  if (c == "GET")     return lineaDatos();
+
+  if (c == "SET") {
+    if (n < 3)                  return "ERR,uso: SET <id> <valor>";
+    if (!cambiarSalida(a, b))   return "ERR,salida no existe";
+    return "OK," + String(a) + "," + String(salidas[a].valor);
+  }
+
+  if (c == "STREAM") {
+    if (n < 2) return "ERR,uso: STREAM <ms>";
+    canal.periodoStream = (a <= 0) ? 0 : max(a, 20L);   // mínimo 20 ms
+    canal.ultimoEnvio = millis();
+    return "OK,STREAM," + String(canal.periodoStream);
+  }
+
+  return "ERR,comando desconocido";
+}
+
+// Lee caracteres de un Stream (Serial o cliente TCP), arma líneas y responde.
+void atenderCanal(Stream& s, Canal& canal) {
+  while (s.available()) {
+    char ch = (char)s.read();
+    if (ch == '\n' || ch == '\r') {
+      if (canal.buffer.length()) {
+        s.print(procesarComando(canal.buffer, canal));
+        s.print("\r\n");
+        canal.buffer = "";
+      }
+    } else if (canal.buffer.length() < 64) {
+      canal.buffer += ch;
+    }
+  }
+  if (canal.periodoStream && millis() - canal.ultimoEnvio >= canal.periodoStream) {
+    canal.ultimoEnvio = millis();
+    s.print(lineaDatos());
+    s.print("\r\n");
+  }
+}
+
+void atenderTCP() {
+  // Un cliente a la vez: si se conecta uno nuevo (p. ej. LabVIEW se reinició), reemplaza al anterior.
+  WiFiClient nuevo = servidorTCP.available();
+  if (nuevo) {
+    if (clienteTCP) clienteTCP.stop();
+    clienteTCP = nuevo;
+    clienteTCP.setNoDelay(true);
+    canalTCP = Canal();
+    Serial.printf("# Cliente TCP conectado: %s\n", clienteTCP.remoteIP().toString().c_str());
+  }
+  if (clienteTCP && clienteTCP.connected()) atenderCanal(clienteTCP, canalTCP);
+}
+
+// ======================= Web (opcional) =======================
+
 void enviarCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -86,8 +200,6 @@ void enviarError(int codigo, const char* mensaje) {
   enviarCORS();
   server.send(codigo, "application/json", String("{\"error\":\"") + mensaje + "\"}");
 }
-
-// ---------- Manejadores HTTP ----------
 
 void manejarRaiz() {
   server.send_P(200, "text/html; charset=utf-8", PAGINA_HTML);
@@ -125,61 +237,51 @@ void manejarEstado() {
   server.send(200, "application/json", json);
 }
 
-// POST /api/salida  con parámetros id y valor (en la URL o en el cuerpo form-urlencoded)
 void manejarSalida() {
   if (!server.hasArg("id") || !server.hasArg("valor")) {
     enviarError(400, "faltan parametros id y valor");
     return;
   }
   long id = server.arg("id").toInt();
-  long valor = server.arg("valor").toInt();
-  if (id < 0 || id >= (long)N_SALIDAS) {
+  if (!cambiarSalida(id, server.arg("valor").toInt())) {
     enviarError(404, "salida no existe");
     return;
   }
-  Salida& s = salidas[id];
-  s.valor = s.pwm ? constrain(valor, 0, 255) : (valor ? 1 : 0);
-  aplicarSalida(s);
-  Serial.printf("Salida %ld (%s, GPIO %d) -> %d\n", id, s.nombre, s.gpio, s.valor);
-
   enviarCORS();
   server.send(200, "application/json",
-              "{\"id\":" + String(id) + ",\"valor\":" + String(s.valor) + "}");
-}
-
-void manejarOpciones() {   // pre-vuelo CORS del navegador
-  enviarCORS();
-  server.send(204);
+              "{\"id\":" + String(id) + ",\"valor\":" + String(salidas[id].valor) + "}");
 }
 
 void manejarNoEncontrado() {
-  if (server.method() == HTTP_OPTIONS) { manejarOpciones(); return; }
-  enviarError(404, "ruta no encontrada");
+  enviarCORS();
+  if (server.method() == HTTP_OPTIONS) { server.send(204); return; }
+  server.send(404, "application/json", "{\"error\":\"ruta no encontrada\"}");
 }
 
-// ---------- WiFi ----------
+// ======================= WiFi =======================
 
 void conectarWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Conectando a %s", WIFI_SSID);
+  Serial.printf("# Conectando a %s...\n", WIFI_SSID);
   unsigned long inicio = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print('.');
-    if (millis() - inicio > 20000) {          // 20 s sin conexión: reinicia y reintenta
-      Serial.println("\nNo se pudo conectar. Reiniciando...");
-      ESP.restart();
-    }
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 15000) {
+    delay(250);
   }
-  Serial.printf("\nConectado. Abre en el navegador: http://%s\n",
-                WiFi.localIP().toString().c_str());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("# WiFi OK. IP: %s  (TCP puerto %u, web http://%s/)\n",
+                  WiFi.localIP().toString().c_str(), PUERTO_TCP,
+                  WiFi.localIP().toString().c_str());
+  } else {
+    // Sin WiFi el ESP32 sigue funcionando por USB; reintenta conectarse en segundo plano.
+    Serial.println("# Sin WiFi: funcionando solo por USB/Serial");
+  }
 }
 
-// ---------- Arduino ----------
+// ======================= Arduino =======================
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(BAUDIOS);
   delay(200);
 
   for (size_t i = 0; i < N_SALIDAS; i++) {
@@ -192,25 +294,24 @@ void setup() {
   analogReadResolution(12);                 // 0-4095
 
   conectarWiFi();
-
-  if (MDNS.begin(NOMBRE_MDNS)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("También disponible en: http://%s.local\n", NOMBRE_MDNS);
-  }
+  if (MDNS.begin(NOMBRE_MDNS)) MDNS.addService("http", "tcp", 80);
 
   server.on("/", HTTP_GET, manejarRaiz);
   server.on("/api/estado", HTTP_GET, manejarEstado);
   server.on("/api/salida", HTTP_POST, manejarSalida);
-  server.on("/api/salida", HTTP_GET, manejarSalida);   // cómodo para probar desde el navegador
+  server.on("/api/salida", HTTP_GET, manejarSalida);
   server.onNotFound(manejarNoEncontrado);
   server.begin();
-  Serial.println("Servidor HTTP iniciado");
+  servidorTCP.begin();
+
+  Serial.println("# Listo. Comandos: PING, INFO, GET, SET <id> <valor>, STREAM <ms>");
 }
 
 void loop() {
-  server.handleClient();
+  atenderCanal(Serial, canalSerial);   // LabVIEW por USB (VISA)
+  atenderTCP();                        // LabVIEW por WiFi (TCP)
+  server.handleClient();               // página web
 
-  // Si se cae el WiFi, intenta reconectar cada 10 s sin bloquear.
   static unsigned long ultimoIntento = 0;
   if (WiFi.status() != WL_CONNECTED && millis() - ultimoIntento > 10000) {
     ultimoIntento = millis();
